@@ -10,7 +10,7 @@ matplotlib==3.8.4
 joblib==1.5.3
 scipy==1.13.1
 
-# Notebook execution
+# Notebook execution 
 jupyter==1.1.1
 nbclient==0.10.2
 nbconvert==7.17.1
