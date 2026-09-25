@@ -22,17 +22,25 @@ It also uses the mock path by default and raises the same error in the real
 LLM path.
 """
 
+import json
 import os
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from typing import TypedDict, List, Literal
 
-from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field, ValidationError
 from langgraph.graph import StateGraph, END
 
 from ingest import CHROMA_PATH, COLLECTION_NAME, EMBEDDING_MODEL_NAME
+from prompt_template import build_prompt
 
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
+
+load_dotenv(Path(__file__).with_name(".env"))
 
 # Quick keyword list for the policy-question heuristic. It checks the
 # lowercased query and routes it to the policy or general path.
@@ -87,7 +95,7 @@ def is_mock_mode() -> bool:
 
 
 class AskResponse(BaseModel):
-    answer: str
+    answer: str = Field(min_length=1)
     sources: List[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
 
@@ -107,13 +115,78 @@ class SupportState(TypedDict, total=False):
 # --- Nodes ---
 
 
+def _call_groq_json(prompt: str, correction: str = "") -> str:
+    """Call Groq's OpenAI-compatible endpoint and return its raw JSON text."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set GROQ_API_KEY to use the optional MOCK_LLM=0 path.")
+
+    messages = [{"role": "user", "content": prompt}]
+    if correction:
+        messages.append({"role": "user", "content": correction})
+
+    payload = {
+        "model": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+    }
+    request = Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Groq request failed: {exc}") from exc
+    return result["choices"][0]["message"]["content"]
+
+
+def _classify_with_llm(query: str) -> str:
+    prompt = (
+        "Classify this user query as JSON with exactly one key, intent. "
+        "The value must be policy_question or general_question. A question "
+        "about Zepto delivery, returns, refunds, membership, tracking, "
+        "cancellation, gift cards, or support hours is policy_question. "
+        f"Query: {query}"
+    )
+    correction = ""
+    for attempt in range(3):
+        try:
+            result = json.loads(_call_groq_json(prompt, correction))
+            intent = result["intent"]
+            if intent not in {"policy_question", "general_question"}:
+                raise ValueError("intent must be policy_question or general_question")
+            return intent
+        except (ValueError, KeyError, TypeError) as exc:
+            correction = (
+                "Your previous response was invalid: " + str(exc)
+                + ". Return only a JSON object with intent set to "
+                "policy_question or general_question."
+            )
+            if attempt == 2:
+                raise RuntimeError("Intent classification failed after 3 attempts.") from exc
+    raise RuntimeError("Intent classification failed.")
+
+
 def classify_intent(state: SupportState) -> SupportState:
-    """Very simple keyword classifier. No LLM call, same behavior in both mock modes."""
-    query_lower = state["query"].lower()
-    if any(keyword in query_lower for keyword in POLICY_KEYWORDS):
-        intent = "policy_question"
+    """Use the required keyword heuristic by default, or the optional LLM path."""
+    query = state["query"]
+    if is_mock_mode():
+        query_lower = query.lower()
+        intent = (
+            "policy_question"
+            if any(keyword in query_lower for keyword in POLICY_KEYWORDS)
+            else "general_question"
+        )
     else:
-        intent = "general_question"
+        intent = _classify_with_llm(query)
     return {"intent": intent}
 
 
@@ -137,33 +210,35 @@ def retrieve_top_chunks(query: str, top_k: int = TOP_K) -> List[dict]:
     return chunks
 
 
-def _generate_with_retry(query: str, chunks: List[dict], mode: str) -> str:
-    """Optional real-LLM branch kept in code for completeness.
-
-    The project still defaults to mock mode, but this helper includes a simple
-    retry loop so the real-LLM path is structured as a resilient fallback rather
-    than a single unguarded call.
-    """
-    if is_mock_mode():
-        return ""
-
-    last_error = None
+def _generate_with_retry(query: str, chunks: List[dict], mode: str) -> AskResponse:
+    """Generate and validate a structured answer, retrying invalid responses."""
+    prompt = build_prompt(query, chunks)
+    allowed_sources = [chunk["id"] for chunk in chunks]
+    correction = ""
     for attempt in range(3):
         try:
-            # This is intentionally not implemented in the graded baseline.
-            # The retry loop is present so the optional extension is structured
-            # like a production-ready generation path.
-            raise NotImplementedError(
-                "Real-LLM generation (MOCK_LLM=0) is an optional extension and "
-                "is not implemented. Set MOCK_LLM=1 (the default)."
+            raw_response = _call_groq_json(prompt, correction)
+            response = AskResponse.model_validate_json(raw_response)
+            if not set(response.sources).issubset(allowed_sources):
+                raise ValueError("response sources must come from retrieved document IDs")
+            return response.model_copy(update={"sources": allowed_sources})
+        except (ValidationError, ValueError) as exc:
+            correction = (
+                "Your previous response failed validation: " + str(exc)
+                + ". Return only a JSON object with non-empty string answer, "
+                "sources as an array of supplied document IDs, and confidence "
+                "as a number from 0 to 1. Do not include markdown fences."
             )
-        except Exception as exc:  # pragma: no cover - retry loop kept for completeness
-            last_error = exc
-            if attempt < 2:
-                continue
-            raise RuntimeError(
-                f"Real-LLM generation failed after 3 attempts for {mode} mode."
-            ) from last_error
+            if attempt == 2:
+                return AskResponse(
+                    answer=(
+                        f"[ERROR] Real-LLM response for {mode} failed validation "
+                        "after 3 attempts."
+                    ),
+                    sources=allowed_sources,
+                    confidence=0.0,
+                )
+    raise RuntimeError(f"Real-LLM response for {mode} failed.")
 
 
 def retrieve_and_answer(state: SupportState) -> SupportState:
@@ -174,7 +249,9 @@ def retrieve_and_answer(state: SupportState) -> SupportState:
         top_chunk_snippet = chunks[0]["text"][:SNIPPET_LEN] if chunks else ""
         answer = f"Based on the retrieved context: {top_chunk_snippet}"
     else:
-        answer = _generate_with_retry(state["query"], chunks, "retrieve_and_answer")
+        answer = _generate_with_retry(
+            state["query"], chunks, "retrieve_and_answer"
+        ).answer
 
     return {
         "retrieved_chunks": chunks,
@@ -188,7 +265,7 @@ def direct_answer(state: SupportState) -> SupportState:
     if is_mock_mode():
         answer = GENERAL_QUESTION_FALLBACK
     else:
-        answer = _generate_with_retry(state["query"], [], "direct_answer")
+        answer = _generate_with_retry(state["query"], [], "direct_answer").answer
 
     return {
         "retrieved_chunks": [],

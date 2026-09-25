@@ -46,18 +46,22 @@ issue and carry no maintenance fees."
 
 Example question: "How long is a Zepto gift card valid for?"
 
-Example answer: "Based on the retrieved context: Zepto gift cards are valid \
-for 1 year from the date of issue and carry no maintenance fees."
+Example answer:
+{{"answer": "Based on the retrieved context: Zepto gift cards are valid \
+for 1 year from the date of issue and carry no maintenance fees.", \
+"sources": ["doc_07"], "confidence": 0.9}}
 
 # FORMAT
-Respond with a single short paragraph in plain English. Do not use bullet \
-points, markdown headers, or JSON in the answer text itself — the answer \
-text is later wrapped into a structured JSON response by the application \
-(answer, sources, confidence) outside of your output.
+Return only one valid JSON object with exactly these keys: "answer" (a \
+short string), "sources" (a list containing only document IDs provided in \
+the context, or an empty list when no context is available), and \
+"confidence" (a number from 0 to 1). Do not include markdown fences or \
+any text outside the JSON object.
 
 # LENGTH
 Keep the answer to 1-3 sentences, grounded strictly in the retrieved \
-context above.
+context above. If the context is empty or insufficient, say that plainly and \
+use an empty sources list.
 """
 
 

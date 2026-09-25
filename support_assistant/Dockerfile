@@ -9,6 +9,7 @@ RUN apt-get update \
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple "torch==2.5.1+cpu" \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY docs/ ./docs/

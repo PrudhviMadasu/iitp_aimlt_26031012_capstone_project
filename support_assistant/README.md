@@ -45,10 +45,10 @@ The workflow is simple and it lines up cleanly with the files in this folder:
 
 **3. Retrieval** — `graph.py`, `retrieve_top_chunks()`. This is called from the `retrieve_and_answer` node. The incoming query is embedded with the same MiniLM model and matched against the vector store for the top 3 relevant chunks. This part runs for real in both modes and does not need any LLM or API key.
 
-**4. Generation** — also in `graph.py`, inside `retrieve_and_answer` and `direct_answer`. This is the only place where the code cares about `MOCK_LLM`:
+**4. Generation** — handled in `graph.py` by `retrieve_and_answer` and `direct_answer`. Intent classification and answer generation are the stages that branch on `MOCK_LLM`:
 
 - `MOCK_LLM=1` (default): the assistant returns a canned answer built from the top retrieved chunk. `direct_answer` returns the fixed message, "I can only answer questions about Zepto policies right now." No network calls happen here.
-- `MOCK_LLM=0` (optional extension, not implemented): this would call a real LLM using the prompt built by `prompt_template.build_prompt()`. The template already exists in `prompt_template.py`, but the branch is not wired up in this project and currently raises `NotImplementedError`.
+- `MOCK_LLM=0` (optional extension): `classify_intent` asks Groq to classify the query, and the answer nodes use the structured prompt from `prompt_template.build_prompt()`. Responses are validated against `AskResponse`; invalid JSON gets up to two corrective retries after the first attempt. This path needs a Groq API key and makes external requests; the default path does neither.
 
 ### LangGraph flow
 
@@ -146,10 +146,23 @@ docker build -t zepto-support-assistant .
 docker run -p 7860:7860 zepto-support-assistant
 ```
 
-The image builds the vector store during the image build with `python ingest.py`, so the container is ready to serve `POST /ask` as soon as it starts.
-
-I could not verify the Docker build locally because Docker is not installed on this machine (`docker --version` returned "command not found"). The setup still matches the actual project layout and the requirements used in this repo.
+The image builds the vector store during the image build with `python ingest.py`, so the container is ready to serve `POST /ask` as soon as it starts. I built the image locally and tested the running container in the default mock mode; the refund example returned a grounded response with `doc_02` among its sources.
 
 ## The `MOCK_LLM` toggle
 
-`MOCK_LLM` defaults to `"1"`, and that is the fully offline path this module is built around. There is no signup, no API key, and no network call to an LLM provider. If `MOCK_LLM=0`, the app would switch to a real LLM path, but that part is intentionally not implemented here. Retrieval stays the same; the generation step is the only part that changes.
+`MOCK_LLM` defaults to `"1"`, and that is the fully offline path this module is built around. There is no signup, no API key, and no network call to an LLM provider. Retrieval stays local and unchanged when the optional real path is enabled; intent classification and answer generation use Groq instead of the deterministic mock responses.
+
+To try the optional Groq free tier, create a key through Groq's console and put it in the local, by creating `support_assistant/.env` file:
+
+```dotenv
+GROQ_API_KEY=your-new-key
+MOCK_LLM=0
+```
+
+Then start the API from this folder:
+
+```bash
+uvicorn main:app --host 127.0.0.1 --port 7860
+```
+
+The default model is `llama-3.3-70b-versatile`; set `GROQ_MODEL` in `.env` to use a different model. These settings affect only the optional LLM calls; document ingestion, embeddings, and retrieval remain local.
